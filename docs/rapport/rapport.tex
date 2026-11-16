@@ -1,0 +1,522 @@
+%% ====================================================================
+%% TP2 MRI, FASI, UPC : comparaison de performance entre technologies
+%% Compilation : pdfLaTeX, deux passes (Overleaf : compilateur par défaut)
+%% Toutes les valeurs proviennent de bench/results/results_2026-11-16T16-50-50-748Z.csv
+%% (agrégées par bench/aggregate.ts, fichier bench/results/summary.md).
+%% ====================================================================
+\documentclass[conference,a4paper]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{mathptmx}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[hidelinks]{hyperref}
+
+\renewcommand{\IEEEkeywordsname}{Mots-clés}
+\renewcommand{\abstractname}{Résumé}
+
+\begin{document}
+
+\title{Rust et Go plus rapides que JavaScript ?\\
+Quatre backends web mesurés sur une même API de tâches adossée à SQLite}
+
+\author{
+\IEEEauthorblockN{Camille MOKOLI NGOY}
+\IEEEauthorblockA{FASI, UPC\\
+camillemokoli@gmail.com}
+\and
+\IEEEauthorblockN{Joseph MBELE KALENGA}
+\IEEEauthorblockA{FASI, UPC\\
+tyronnklg@gmail.com}
+\and
+\IEEEauthorblockN{Nicolas MALEKA LIKEMBO}
+\IEEEauthorblockA{FASI, UPC\\
+reymaleka000@gmail.com}
+\and
+\IEEEauthorblockN{Béliana MALANDALA LUNGUNGU}
+\IEEEauthorblockA{FASI, UPC\\
+{[ADRESSE À COMPLÉTER]}}
+}
+
+\maketitle
+
+\begin{abstract}
+On lit souvent qu'un service web écrit en Rust ou en Go tient mieux la
+charge qu'un service écrit en JavaScript. Nous avons voulu vérifier cette
+affirmation sur un cas concret : une API REST de gestion de tâches,
+adossée à SQLite, écrite quatre fois avec ElysiaJS et Hono (tous deux sur
+le moteur Bun), Axum (Rust) et la bibliothèque standard net/http de Go.
+Les quatre versions suivent un contrat commun et renvoient des réponses
+identiques, ce que nous avons vérifié automatiquement. Chaque version a
+été soumise à k6 dans un conteneur limité à 2 cœurs et 2 Gio de mémoire,
+sur deux scénarios (lecture d'une tâche, mélange lecture et écriture) et
+trois niveaux de charge (10, 100 et 500 utilisateurs virtuels), avec
+4 essais par configuration, soit 96 mesures et 11,7 millions de requêtes.
+Le résultat contredit notre hypothèse de départ. À 500 utilisateurs en
+scénario mixte, Elysia traite 14\,477 requêtes par seconde et Hono
+14\,000, contre 8\,953 pour Axum et 7\,371 pour Go, dont le 99\textsuperscript{e}
+centile de latence atteint 308~ms. Rust reste le plus sobre en mémoire.
+Nous attribuons l'essentiel de ces écarts à l'accès à la base, sérialisé
+sur une seule connexion, plutôt qu'au langage lui-même. Ces résultats
+valent pour cette architecture et cette machine ; ils ne permettent pas
+de classer les langages en général.
+\end{abstract}
+
+\begin{IEEEkeywords}
+test de charge, performance des backends web, Bun, Rust, Go, SQLite, k6
+\end{IEEEkeywords}
+
+%% ====================================================================
+\section{Introduction}
+%% ====================================================================
+Le temps de réponse d'un service web compte pour l'utilisateur, qui
+abandonne une page lente, et pour celui qui l'héberge, car un serveur
+capable de traiter plus de requêtes avec le même processeur coûte moins
+cher. Le choix d'une technologie backend se fait pourtant souvent sur
+des réputations : Rust serait plus rapide que Go, Go plus rapide que
+JavaScript, et un framework « tiendrait mieux la charge » qu'un autre.
+
+Ces réputations s'appuient en partie sur des mesures publiques. Le projet
+TechEmpower Framework Benchmarks compare depuis 2013 des centaines de
+frameworks sur des tests normalisés, dont la sérialisation JSON et les
+requêtes en base~\cite{techempower}. Des retours d'expérience industriels
+pèsent aussi. Discord a réécrit en Rust son service « Read States »,
+écrit en Go, parce que le ramasse-miettes de Go parcourait périodiquement
+un très grand cache LRU en mémoire et provoquait des pics de latence ;
+la version Rust s'est montrée meilleure en latence, en CPU et en
+mémoire~\cite{discord}. Ces résultats portent sur des contextes précis :
+une machine puissante et un code optimisé par les communautés pour
+TechEmpower, un tas de plusieurs millions d'objets chez Discord. Rien
+n'indique qu'ils se transposent à une petite API sur une machine modeste.
+
+Notre question de recherche est donc la suivante : pour une même API REST
+de gestion de tâches adossée à SQLite, exécutée sur 2 cœurs et 2 Gio de
+mémoire, quelle technologie parmi Elysia, Hono, Axum et Go offre le
+meilleur débit et les latences les plus basses, et à quel coût en CPU et
+en mémoire ?
+
+Nous avions formulé trois hypothèses avant les mesures.
+H1 : Axum et Go, compilés et capables d'utiliser plusieurs cœurs,
+dépassent nettement les deux versions Bun en débit.
+H2 : les écritures, sérialisées par SQLite, réduisent les écarts entre
+technologies dans le scénario mixte.
+H3 : le tas de notre application étant minuscule, le ramasse-miettes de
+Go ne produit pas l'allongement de la latence de queue observé par
+Discord.
+
+La section~II décrit l'application, les technologies, les métriques et
+le protocole. La section~III explique comment les versions ont été
+écrites et comment leur équivalence a été vérifiée. La section~IV
+présente et discute les résultats, la section~V conclut.
+
+%% ====================================================================
+\section{Méthodologie}
+%% ====================================================================
+\subsection{Application de référence}
+L'application est une API REST de gestion de tâches (« todo »). Une tâche
+possède un identifiant entier, un titre obligatoire, une description
+facultative, un indicateur d'achèvement et une date de création. Les
+données sont stockées dans une table SQLite unique dont le schéma est
+identique pour toutes les versions. Six routes sont exposées :
+\texttt{GET /health}, \texttt{GET /tasks} (les 100 premières tâches,
+triées par identifiant), \texttt{GET}, \texttt{PUT} et \texttt{DELETE}
+sur \texttt{/tasks/\{id\}}, et \texttt{POST /tasks}.
+
+Le comportement attendu est fixé par un contrat OpenAPI commun. Un
+identifiant non numérique donne une erreur 400 \texttt{invalid\_id}, un
+corps invalide une erreur 400 \texttt{validation\_error}, une tâche
+absente une erreur 404 \texttt{not\_found}. Une création réussie renvoie
+201 avec la tâche, une suppression 204 sans corps. \texttt{PUT} remplace
+la tâche entière. Au démarrage, chaque version crée 1\,000 tâches
+déterministes (titre « Task $i$ », achevée si $i$ est multiple de 5).
+
+\subsection{Technologies comparées}
+Nous avons retenu quatre technologies que les membres du groupe
+utilisent déjà (tableau~\ref{tab:techno}). Elysia et Hono représentent
+l'écosystème JavaScript et TypeScript récent ; les deux tournent sur Bun,
+ce qui permet de séparer l'effet du framework de celui du moteur
+d'exécution. Axum, sur le moteur asynchrone Tokio, représente Rust. Pour
+Go, nous avons choisi la bibliothèque standard \texttt{net/http}, sans
+framework, parce que c'est l'usage le plus courant de ce langage pour un
+service HTTP.
+
+\begin{table}[htbp]
+\caption{Technologies comparées}
+\label{tab:techno}
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Technologie} & \textbf{Langage} & \textbf{Version} \\
+\midrule
+Elysia (Bun 1.4.4) & TypeScript & 1.4.32 \\
+Hono (Bun 1.4.4) & TypeScript & 4.13.18 \\
+Axum (Tokio 1.54.1) & Rust & 0.8.9 \\
+net/http & Go & 1.27 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+L'accès à SQLite passe par le pilote le plus courant de chaque
+écosystème : \texttt{bun:sqlite}, intégré à Bun, pour les deux versions
+TypeScript ; \texttt{rusqlite} 0.32.1, qui embarque la bibliothèque C
+de SQLite, pour Rust ; \texttt{modernc.org/sqlite}, une traduction de
+SQLite en Go pur qui évite CGO, pour Go. Toutes les versions utilisent
+une seule connexion par processus, le journal WAL~\cite{sqlitewal} et
+\texttt{synchronous = NORMAL}.
+
+\subsection{Métriques}
+Le débit, exprimé en requêtes par seconde (RPS), est le nombre de
+réponses reçues divisé par la durée de la mesure. Il indique combien de
+travail un serveur accomplit avec les ressources dont il dispose. k6 le
+calcule à partir du compteur \texttt{http\_reqs}.
+
+La latence est le temps entre l'envoi d'une requête et la réception
+complète de la réponse, en millisecondes, mesuré par k6
+(\texttt{http\_req\_duration}). Nous retenons la médiane (P50) et les
+centiles 90, 95 et 99. La moyenne masque les requêtes lentes ; le P99
+dit ce que subit un utilisateur sur cent, et c'est souvent lui qui
+départage deux serveurs au débit voisin.
+
+Le taux d'erreur est la part de requêtes en échec, au sens de k6 (erreur
+réseau ou statut HTTP 4xx et 5xx), complétée par des vérifications du
+statut attendu pour chaque requête. Un serveur rapide qui échoue n'est
+pas performant.
+
+La consommation de CPU est relevée par \texttt{docker stats} pendant la
+mesure, en pourcentage d'un cœur : 100~\% correspond à un cœur occupé,
+200~\% au maximum autorisé. La mémoire est le maximum de mémoire utilisée par le
+conteneur pendant la mesure, en Mio. Ces deux grandeurs
+disent ce que coûte le débit obtenu.
+
+\subsection{Outils et environnement de test}
+La charge est générée par k6~\cite{k6} en boucle fermée : chaque
+utilisateur virtuel envoie une requête, attend la réponse et recommence
+sans pause. Chaque version tourne dans un conteneur Docker limité par
+\texttt{--cpus 2} et \texttt{--memory 2g}, ce qui reproduit une petite
+machine virtuelle de 2 cœurs et 2 Gio. k6 s'exécute hors du conteneur,
+sur la même machine hôte, un ordinateur portable sous Windows avec
+Docker Desktop [MODÈLE DU PROCESSEUR ET MÉMOIRE DE L'HÔTE À COMPLÉTER].
+
+Deux scénarios ont été mesurés. Dans \texttt{get\_one}, chaque requête
+lit une tâche tirée au hasard parmi les 1\,000 semées. Le scénario
+\texttt{mixed} imite un usage réaliste : 50~\% de lectures d'une tâche,
+20~\% de listes, 15~\% de créations, 10~\% de modifications et 5~\% de
+couples création puis suppression.
+
+\subsection{Déroulement des tests}
+Le banc d'essai est entièrement automatisé par le script
+\texttt{bench/run.ts} du dépôt. Pour chaque mesure, il démarre un
+conteneur neuf, donc une base fraîche de 1\,000 tâches, attend que
+\texttt{/health} réponde, puis lance 3~s de chauffe (scénario mixte,
+10 utilisateurs) dont les résultats sont écartés. Il lance ensuite la
+mesure proprement dite pendant 8~s, échantillonne CPU et mémoire en
+parallèle, enregistre une ligne dans le fichier CSV de résultats et
+détruit le conteneur.
+
+Les mesures sont organisées en 4 tours. Un tour parcourt les
+2 scénarios, les 3 niveaux de charge (10, 100 et 500 utilisateurs) et,
+pour chaque palier, les 4 technologies dans un ordre tiré au hasard,
+afin qu'aucune ne soit systématiquement mesurée en premier ou en
+dernier. Le tout représente 96 mesures. Un autre groupe peut refaire
+l'expérience avec trois commandes : \texttt{bun bench/run.ts build},
+\texttt{bun bench/run.ts smoke}, puis
+\texttt{bun bench/run.ts run --runs 4 --scenarios get\_one,mixed
+--levels 10,100,500}.
+
+%% ====================================================================
+\section{Développement}
+%% ====================================================================
+\subsection{Réalisation des versions}
+Les quatre versions sont rassemblées dans un dépôt Git organisé en
+monorepo avec Turborepo, une application par dossier sous
+\texttt{apps/}. Chacune tient en un seul fichier source et suit la même
+structure : ouverture de la base et réglages, création du schéma et des
+données si la table est vide, préparation des requêtes SQL, puis
+déclaration des routes. Les requêtes SQL sont identiques d'une version à
+l'autre ; les écritures utilisent \texttt{RETURNING} pour renvoyer la
+tâche sans seconde requête.
+
+La validation des entrées est écrite à la main dans les quatre versions,
+avec les mêmes règles, plutôt que confiée aux mécanismes propres à
+chaque framework, qui n'auraient pas eu le même coût ni produit
+exactement les mêmes erreurs. En Rust, la connexion est partagée entre
+les tâches Tokio par un \texttt{Mutex} ; en Go, le pool de
+\texttt{database/sql} est limité à une connexion.
+
+Les versions, le banc d'essai et le script d'agrégation ont été écrits
+avec l'aide de l'assistant Claude (Anthropic), comme la consigne le
+permet ; le même assistant a servi à la rédaction de ce rapport. Le
+groupe a relu le code, construit et exécuté les versions, et réalisé
+toutes les mesures sur sa propre machine.
+
+\subsection{Équivalence fonctionnelle}
+Le script \texttt{bench/smoke.ts} envoie à chaque version, sur une base
+fraîche, la même suite de 27 requêtes : santé, liste, lectures
+présentes, absentes et mal formées, créations valides et invalides (titre
+manquant, vide ou non textuel, types erronés, JSON invalide, tableau),
+modifications, suppressions. Il vérifie le statut, le type de contenu et
+le contenu de chaque réponse, puis enregistre une transcription
+normalisée où seule la date de création est masquée. La commande
+\texttt{smoke} compare enfin les transcriptions des quatre versions,
+qui doivent être identiques octet pour octet. Le banc refuse de lancer
+les mesures tant que ce contrôle échoue.
+
+\subsection{Difficultés rencontrées}
+Le premier contrôle d'équivalence a échoué pour Go alors que chaque
+version passait ses propres vérifications. Le pilote
+\texttt{modernc.org/sqlite} convertit les colonnes déclarées
+\texttt{DATETIME} en valeurs temporelles Go, que la sérialisation JSON
+écrit au format RFC~3339, différent du format texte renvoyé par les
+autres versions. Une conversion explicite en texte dans la requête SQL a
+corrigé l'écart, et le contrôle vérifie désormais le format de cette
+date. Hono, d'abord prévu sur Node.js, a été exécuté sur Bun comme
+Elysia : cela simplifie la comparaison entre frameworks, mais retire
+Node.js de l'étude. Le démarrage de Docker Desktop sous Windows a aussi
+demandé quelques réglages avant les premières mesures.
+
+%% ====================================================================
+\section{Résultats et discussion}
+%% ====================================================================
+\subsection{Données recueillies}
+Les 96 mesures ont abouti. Elles totalisent 11\,726\,589 requêtes. Le
+fichier \texttt{bench/results/results\_2026-11-16T16-50-50-748Z.csv}
+contient une ligne par mesure (technologie, scénario, charge, essai,
+débit, latences, erreurs, CPU, mémoire), et le dossier
+\texttt{bench/results/raw/} conserve le résumé brut de k6 pour chacune.
+Les valeurs présentées ici sont des moyennes sur les 4 essais ; l'écart
+type du débit est indiqué. Une seule requête a échoué sur l'ensemble,
+pendant un essai de Go en scénario mixte à 500 utilisateurs : le taux
+d'erreur est donc nul en pratique pour toutes les versions, et nous ne
+l'utilisons pas pour les départager. Le tableau~\ref{tab:resultats}
+résume la charge la plus forte.
+
+\begin{table}[htbp]
+\caption{Synthèse des mesures à 500 utilisateurs (moyenne sur 4 essais)}
+\label{tab:resultats}
+\centering
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Technologie} & \textbf{Débit} & \textbf{P50} & \textbf{P99} & \textbf{CPU} & \textbf{RAM} \\
+ & (req/s) & (ms) & (ms) & (\%) & (Mio) \\
+\midrule
+\multicolumn{6}{@{}l}{\textit{Scénario get\_one}} \\
+Elysia & 29\,206 $\pm$ 618 & 14,7 & 38,7 & 72 & 30 \\
+Hono & 28\,190 $\pm$ 1\,122 & 15,5 & 39,9 & 64 & 29 \\
+Axum & 24\,945 $\pm$ 818 & 18,3 & 40,3 & 115 & 21 \\
+Go & 14\,061 $\pm$ 355 & 24,2 & 167,3 & 110 & 34 \\
+\midrule
+\multicolumn{6}{@{}l}{\textit{Scénario mixed}} \\
+Elysia & 14\,477 $\pm$ 344 & 31,0 & 73,9 & 70 & 33 \\
+Hono & 14\,000 $\pm$ 538 & 32,4 & 75,3 & 67 & 30 \\
+Axum & 8\,953 $\pm$ 180 & 49,9 & 106,1 & 91 & 25 \\
+Go & 7\,371 $\pm$ 187 & 46,8 & 307,5 & 105 & 37 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analyse}
+À faible charge, les quatre versions se ressemblent. À 10 utilisateurs
+en lecture, Elysia, Hono et Axum se situent entre 11\,882 et
+12\,082 requêtes par seconde, des écarts inférieurs à l'écart type de
+leurs propres essais, et leurs médianes sont toutes proches de 0,6~ms.
+Go est un peu en retrait, à 10\,547 requêtes par seconde.
+
+La figure~\ref{fig:barres} montre que les écarts apparaissent dès
+100 utilisateurs. En lecture, Elysia atteint 29\,789 requêtes par
+seconde et Hono 28\,586, Axum 23\,714, et Go 14\,308, soit environ deux
+fois moins que les versions Bun.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=5cm,
+  ybar, bar width=14pt, ymin=0, ymax=35000,
+  symbolic x coords={Elysia,Hono,Axum,Go},
+  xtick=data,
+  ylabel={Débit (requêtes/s)},
+  nodes near coords,
+  nodes near coords style={font=\scriptsize},
+  scaled y ticks=false,
+  yticklabel style={/pgf/number format/1000 sep={\,}},
+  tick label style={font=\footnotesize},
+  label style={font=\footnotesize},
+  enlarge x limits=0.18]
+\addplot[fill=gray!40, draw=black] coordinates
+  {(Elysia,29789) (Hono,28586) (Axum,23714) (Go,14308)};
+\end{axis}
+\end{tikzpicture}
+\caption{Débit moyen sur 4 essais, scénario get\_one, 100 utilisateurs simultanés.}
+\label{fig:barres}
+\end{figure}
+
+La figure~\ref{fig:debit} suit le débit du scénario mixte selon la
+charge. Les versions Bun passent d'environ 10\,000 à 14\,500 requêtes
+par seconde entre 10 et 100 utilisateurs, puis plafonnent. Axum et Go
+plafonnent dès 10 utilisateurs, autour de 9\,000 et 7\,400 requêtes par
+seconde. Ajouter des utilisateurs au-delà de 100 n'augmente le débit
+d'aucune version ; cela allonge seulement l'attente.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+  width=\columnwidth, height=5cm,
+  xlabel={Utilisateurs simultanés (échelle logarithmique)},
+  ylabel={Débit (requêtes/s)},
+  xtick={10,100,500}, xticklabels={10,100,500},
+  scaled y ticks=false,
+  yticklabel style={/pgf/number format/1000 sep={\,}},
+  tick label style={font=\footnotesize},
+  label style={font=\footnotesize},
+  legend style={font=\scriptsize, at={(0.03,0.97)}, anchor=north west},
+  ymin=0, ymax=17000]
+\addplot[black, thick, mark=*] coordinates {(10,10049) (100,14644) (500,14477)};
+\addplot[black, thick, dashed, mark=square*] coordinates {(10,9982) (100,14122) (500,14000)};
+\addplot[black, thick, dotted, mark=triangle*] coordinates {(10,8729) (100,9324) (500,8953)};
+\addplot[gray, thick, dashdotted, mark=diamond*] coordinates {(10,7654) (100,7299) (500,7371)};
+\legend{Elysia, Hono, Axum, Go}
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{Évolution du débit selon la charge, scénario mixed (moyenne sur 4 essais).}
+\label{fig:debit}
+\end{figure}
+
+La latence de queue sépare plus nettement les versions
+(figure~\ref{fig:p99}). À 500 utilisateurs en scénario mixte, le P99
+vaut 74~ms pour Elysia, 75~ms pour Hono, 106~ms pour Axum et 308~ms pour
+Go. En lecture, Axum rejoint les versions Bun (40~ms) alors que Go monte
+à 167~ms, quatre fois plus. Chez Go, l'écart entre la médiane et le
+P99 est le plus grand : un utilisateur sur cent attend plus de six fois
+plus que l'utilisateur médian.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  width=\columnwidth, height=5cm,
+  xlabel={Utilisateurs simultanés (échelle logarithmique)},
+  ylabel={Latence P99 (ms, échelle log.)},
+  xtick={10,100,500}, xticklabels={10,100,500},
+  tick label style={font=\footnotesize},
+  label style={font=\footnotesize},
+  legend style={font=\scriptsize, at={(0.03,0.97)}, anchor=north west}]
+\addplot[black, thick, mark=*] coordinates {(10,3.32) (100,20.96) (500,73.85)};
+\addplot[black, thick, dashed, mark=square*] coordinates {(10,3.23) (100,21.54) (500,75.29)};
+\addplot[black, thick, dotted, mark=triangle*] coordinates {(10,3.35) (100,23.12) (500,106.10)};
+\addplot[gray, thick, dashdotted, mark=diamond*] coordinates {(10,3.77) (100,64.79) (500,307.50)};
+\legend{Elysia, Hono, Axum, Go}
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{Latence au 99\textsuperscript{e} centile selon la charge, scénario mixed (moyenne sur 4 essais).}
+\label{fig:p99}
+\end{figure}
+
+Le coût en ressources inverse en partie ce classement. Les versions Bun
+n'ont jamais dépassé 92~\% d'un cœur, alors qu'Axum et Go ont occupé
+jusqu'à plus de 1,5 cœur. Pour le même travail, Axum utilise le moins de
+mémoire : 6 à 25~Mio selon la charge, contre 14 à 37~Mio pour Go et
+20 à 33~Mio pour les versions Bun. Enfin, Elysia et Hono ne se
+distinguent pas : à chaque palier, leur écart est du même ordre que la
+dispersion de leurs essais.
+
+\subsection{Interprétation et discussion}
+L'hypothèse H1 est réfutée dans nos conditions. Les versions Bun sont
+les plus rapides alors qu'elles exécutent le code de l'application sur
+un seul fil, comme le montre leur CPU plafonné sous un cœur. Notre
+explication tient à l'accès à la base. Toutes les versions partagent une
+connexion SQLite unique. Sous Bun, les requêtes passent l'une après
+l'autre sur le même fil, sans verrou ni changement de contexte. Axum et
+Go répartissent les requêtes sur plusieurs fils, qui se disputent ensuite
+cette unique connexion : le verrou de Rust et la file d'attente du pool
+de Go ajoutent un coût de synchronisation sans apporter de parallélisme,
+puisque le travail utile reste sérialisé. Le CPU supplémentaire consommé
+par Axum et Go, sans gain de débit, va dans le même sens.
+
+Le retard propre à Go s'explique probablement aussi par son pilote :
+\texttt{modernc.org/sqlite} est une traduction automatique de SQLite en
+Go, alors que \texttt{bun:sqlite} et \texttt{rusqlite} appellent la
+bibliothèque C d'origine. Notre étude compare donc des couples langage
+et pilote, et non des langages isolés. Nous n'avons pas fait de
+profilage, et ces explications restent des hypothèses à vérifier.
+
+L'hypothèse H2 n'est confirmée qu'en partie. Le scénario mixte divise
+bien le débit de toutes les versions, mais il ne rapproche pas les
+technologies : le rapport entre Elysia et Go reste voisin de deux, et
+Axum perd davantage que les autres (il conserve 36~\% de son débit de
+lecture, contre environ 50~\% pour les autres versions). La liste de
+100 tâches et les écritures, qui gardent le verrou plus longtemps,
+pourraient en être la cause.
+
+Pour H3, nos données ne permettent pas de conclure. Go présente bien la
+latence de queue la plus élevée, mais nous n'avons relevé que des
+centiles agrégés sur 8~s, sans trace du ramasse-miettes. L'attente dans
+la file de la connexion unique suffit à expliquer un P99 qui croît avec
+le nombre d'utilisateurs, sans qu'il soit nécessaire d'invoquer le
+ramasse-miettes. La situation de Discord, un tas de plusieurs millions
+d'objets~\cite{discord}, n'a d'ailleurs rien de commun avec la nôtre.
+
+Plusieurs limites encadrent ces résultats. Quatre essais par
+configuration, au lieu des quarante de l'exemple du cours, donnent des
+moyennes stables (écarts types inférieurs à 5~\% du débit pour la
+plupart) mais une estimation fragile de la dispersion. k6 et Docker
+partagent la même machine : à forte charge, le générateur de charge
+consomme une part du processeur et peut plafonner lui-même, ce qui
+pourrait limiter les versions les plus rapides. Les latences maximales
+proches d'une seconde, observées pour toutes les versions en lecture à
+500 utilisateurs, ressemblent à un délai de retransmission réseau du
+système hôte plutôt qu'à un comportement des serveurs. Nous n'avons pas
+mesuré de scénario purement écriture, ni d'autres réglages de connexion.
+Enfin, chaque mesure ne dure que 8~s ; des effets plus lents, comme la
+croissance de la mémoire, échappent à ce protocole.
+
+%% ====================================================================
+\section{Conclusion}
+%% ====================================================================
+Nous nous demandions quelle technologie, parmi Elysia, Hono, Axum et Go,
+sert le mieux une API de tâches adossée à SQLite sur une machine de
+2 cœurs et 2 Gio. Dans nos mesures, les deux versions Bun offrent le
+meilleur débit et les latences de queue les plus basses, Axum vient
+ensuite avec la plus faible empreinte mémoire, et Go ferme la marche.
+Ce classement va à l'encontre de la réputation des langages compilés,
+et nous l'attribuons d'abord à la conception de l'accès à la base, une
+connexion unique qui annule l'avantage du multi-cœur, ainsi qu'aux
+différences entre pilotes SQLite.
+
+Le résultat le plus utile de cette étude est peut-être celui-là : sur
+une application de ce type, l'accès aux données pèse davantage que le
+langage du serveur. Pour aller plus loin, il faudrait répéter les
+mesures sur une machine dédiée au générateur de charge, tester un pool
+de connexions en lecture pour Axum et Go, remplacer
+\texttt{modernc.org/sqlite} par un pilote C en Go, et profiler chaque
+version pour confirmer les explications avancées ici.
+
+%% ====================================================================
+\begin{thebibliography}{00}
+\bibitem{techempower} TechEmpower, « Framework Benchmarks Round 23 »,
+2025. [En ligne]. Disponible :
+\url{https://www.techempower.com/blog/tag/tfb/}. [Consulté le 16 novembre 2026].
+\bibitem{discord} J. Howarth, « Why Discord is switching from Go to
+Rust », Discord Blog, février 2020. [En ligne]. Disponible :
+\url{https://discord.com/blog/why-discord-is-switching-from-go-to-rust}.
+[Consulté le 16 novembre 2026].
+\bibitem{sqlitewal} SQLite, « Write-Ahead Logging ». [En ligne].
+Disponible : \url{https://www.sqlite.org/wal.html}. [Consulté le
+16 novembre 2026].
+\bibitem{k6} Grafana Labs, « Grafana k6 documentation ». [En ligne].
+Disponible : \url{https://grafana.com/docs/k6/latest/}. [Consulté le
+16 novembre 2026].
+\bibitem{tp} Faculté des sciences informatiques, UPC, « Méthode de
+recherche en informatique, travail pratique n\textsuperscript{o}~2 :
+comparer la performance d'une même application écrite avec plusieurs
+technologies », novembre 2026.
+\end{thebibliography}
+
+\end{document}

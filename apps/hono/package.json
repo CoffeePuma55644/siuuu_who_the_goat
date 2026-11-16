@@ -1,12 +1,14 @@
 {
   "name": "hono",
+  "private": true,
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts"
   },
   "dependencies": {
-    "hono": "^4.13.16"
+    "hono": "4.13.18"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "1.4.4"
   }
 }

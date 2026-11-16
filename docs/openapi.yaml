@@ -1,0 +1,60 @@
+openapi: 3.0.3
+info:
+  title: Todo API (contrat commun des 4 versions)
+  version: 1.0.0
+  description: |
+    Règles communes, appliquées dans cet ordre pour PUT :
+    1. identifiant invalide (hors ^[0-9]+$) -> 400 invalid_id
+    2. corps invalide -> 400 validation_error
+    3. tâche absente -> 404 not_found
+    Corps valide : objet JSON ; title = chaîne non vide ; description = chaîne, null ou absente ;
+    completed = booléen ou absent (défaut false). Les champs inconnus sont ignorés.
+    PUT remplace entièrement la ressource (description absente -> null, completed absent -> false).
+    Base semée : 1000 tâches (id 1..1000), "Task i", "Description of task i", completed = (i % 5 == 0).
+paths:
+  /health:
+    get:
+      responses:
+        "200": { description: 'Corps {"status":"ok"}' }
+  /tasks:
+    get:
+      description: 100 premières tâches, triées par id croissant.
+      responses:
+        "200": { description: Tableau de Task }
+    post:
+      responses:
+        "201": { description: Task créée }
+        "400": { description: 'validation_error' }
+  /tasks/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, pattern: "^[0-9]+$" } }
+    get:
+      responses:
+        "200": { description: Task }
+        "400": { description: invalid_id }
+        "404": { description: not_found }
+    put:
+      responses:
+        "200": { description: Task modifiée }
+        "400": { description: invalid_id ou validation_error }
+        "404": { description: not_found }
+    delete:
+      responses:
+        "204": { description: Supprimée, corps vide }
+        "400": { description: invalid_id }
+        "404": { description: not_found }
+components:
+  schemas:
+    Task:
+      type: object
+      required: [id, title, description, completed, created_at]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        completed: { type: boolean }
+        created_at: { type: string, description: 'SQLite CURRENT_TIMESTAMP, "YYYY-MM-DD HH:MM:SS" (UTC)' }
+    Error:
+      type: object
+      properties:
+        error: { type: string, enum: [invalid_id, validation_error, not_found] }

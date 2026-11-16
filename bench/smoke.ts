@@ -38,6 +38,12 @@ export async function runSmoke(base: string) {
       }
     }
     if (r.status !== expect) fails.push(`${step}: statut ${r.status}, attendu ${expect}`);
+    for (const o of Array.isArray(parsed) ? parsed : [parsed]) {
+      if (o && typeof o === "object" && "created_at" in o && !TS.test(o.created_at)) {
+        fails.push(`${step}: created_at au mauvais format (${o.created_at})`);
+        break;
+      }
+    }
     rec.push({ step, status: r.status, body: norm(parsed) });
     return parsed;
   }

@@ -24,7 +24,8 @@ type Task struct {
 	CreatedAt   string  `json:"created_at"`
 }
 
-const cols = "id, title, description, completed, created_at"
+// CAST : sans lui, modernc renvoie les colonnes DATETIME en time.Time (format RFC3339)
+const cols = "id, title, description, completed, CAST(created_at AS TEXT)"
 
 var (
 	stmtList   *sql.Stmt

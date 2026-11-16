@@ -107,7 +107,16 @@ if (cmd === "build") {
   for (const t of techs.slice(1)) {
     const same = transcripts[t] === ref;
     console.log(`transcription ${t} == ${techs[0]} : ${same ? "identique" : "DIFFÉRENTE"}`);
-    if (!same) bad = true;
+    if (!same) {
+      bad = true;
+      const a = JSON.parse(ref!), b = JSON.parse(transcripts[t]!);
+      const i = a.findIndex((x: unknown, j: number) => JSON.stringify(x) !== JSON.stringify(b[j]));
+      if (i >= 0) {
+        console.log(`   1re différence, étape « ${a[i].step} » :`);
+        console.log(`   ${techs[0]} : ${JSON.stringify(a[i]).slice(0, 300)}`);
+        console.log(`   ${t} : ${JSON.stringify(b[i]).slice(0, 300)}`);
+      }
+    }
   }
   process.exit(bad ? 1 : 0);
 } else if (cmd === "run") {

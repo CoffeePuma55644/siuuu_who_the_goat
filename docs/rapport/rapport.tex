@@ -41,7 +41,7 @@ reymaleka000@gmail.com}
 \and
 \IEEEauthorblockN{Béliana MALANDALA LUNGUNGU}
 \IEEEauthorblockA{FASI, UPC\\
-{[ADRESSE À COMPLÉTER]}}
+belianamalandala@gmail.com}
 }
 
 \maketitle
@@ -201,7 +201,8 @@ sans pause. Chaque version tourne dans un conteneur Docker limité par
 \texttt{--cpus 2} et \texttt{--memory 2g}, ce qui reproduit une petite
 machine virtuelle de 2 cœurs et 2 Gio. k6 s'exécute hors du conteneur,
 sur la même machine hôte, un ordinateur portable sous Windows avec
-Docker Desktop [MODÈLE DU PROCESSEUR ET MÉMOIRE DE L'HÔTE À COMPLÉTER].
+Docker Desktop, équipé d'un processeur Intel Core i9-14900HX et de
+16 Gio de mémoire vive.
 
 Deux scénarios ont été mesurés. Dans \texttt{get\_one}, chaque requête
 lit une tâche tirée au hasard parmi les 1\,000 semées. Le scénario
@@ -467,9 +468,10 @@ Plusieurs limites encadrent ces résultats. Quatre essais par
 configuration, au lieu des quarante de l'exemple du cours, donnent des
 moyennes stables (écarts types inférieurs à 5~\% du débit pour la
 plupart) mais une estimation fragile de la dispersion. k6 et Docker
-partagent la même machine : à forte charge, le générateur de charge
-consomme une part du processeur et peut plafonner lui-même, ce qui
-pourrait limiter les versions les plus rapides. Les latences maximales
+partagent la même machine. Le processeur de l'hôte est puissant, donc
+une saturation du générateur de charge est peu probable, mais la
+couche réseau de Docker Desktop sous Windows ajoute un coût commun à
+toutes les versions et pourrait limiter les plus rapides. Les latences maximales
 proches d'une seconde, observées pour toutes les versions en lecture à
 500 utilisateurs, ressemblent à un délai de retransmission réseau du
 système hôte plutôt qu'à un comportement des serveurs. Nous n'avons pas
